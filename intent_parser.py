@@ -1,0 +1,169 @@
+"""
+Jarvis Intent Parser — Phase 0 prototype.
+
+Takes a raw utterance, returns a structured intent using Claude with forced tool use.
+Also handles clarifying questions when confidence is low.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
+import anthropic
+
+# Legal tier × product combinations (sourced from the brief)
+LEGAL_COMBOS = {
+    "quota_grant": {
+        "valid_tiers": ["creator", "pro", "business"],
+        "api_quota_tiers": ["any"],  # API quota not tier-gated
+        "note": "credits only valid on creator|pro|business; API quota is separate",
+    },
+    "ent_sub_grant": {
+        "valid_products": ["video_translate", "video_avatar", "video_studio", "personalized_video"],
+        "requires_ae": True,
+    },
+}
+
+INTENT_TOOL = {
+    "name": "parse_intent",
+    "description": "Parse a Slack message into a structured Jarvis intent.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["quota_grant", "create_account", "lookup", "ent_sub_grant", "bulk_grant", "unknown"],
+                "description": "The action to perform",
+            },
+            "target_email": {
+                "type": "string",
+                "description": "Target user email address",
+            },
+            "tier": {
+                "type": "string",
+                "enum": ["creator", "pro", "business", "enterprise", "free", None],
+                "description": "Subscription tier",
+            },
+            "credits": {
+                "type": "integer",
+                "description": "Number of credits to grant",
+            },
+            "duration_days": {
+                "type": "integer",
+                "description": "Duration in days",
+            },
+            "product": {
+                "type": "string",
+                "description": "Specific product (for API quota: 'api'; for generative: 'generative_credit')",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Business reason for the action",
+            },
+            "ae_attribution": {
+                "type": "string",
+                "description": "AE name for enterprise sub attribution",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence score 0.0-1.0 for this parse",
+            },
+            "needs_clarification": {
+                "type": "boolean",
+                "description": "True if a field is ambiguous and needs clarification",
+            },
+            "clarifying_question": {
+                "type": "string",
+                "description": "Question to ask the user if needs_clarification is true",
+            },
+        },
+        "required": ["action", "confidence"],
+    },
+}
+
+SYSTEM_PROMPT = """You are the intent parser for Jarvis, HeyGen's internal ops bot.
+Parse Slack utterances into structured intents. Be conservative with confidence — 
+if anything is ambiguous (wrong tier, missing email, unclear amount), set needs_clarification=true
+and ask a specific question. Do NOT guess on target_email.
+
+Legal combinations:
+- quota_grant: credits only valid with tier=creator|pro|business
+- API quota grants use product="api", no tier needed
+- Generative credits use product="generative_credit"
+- Bulk grants: if email list not inline, set needs_clarification asking for CSV
+
+Raw CLI mode: if utterance starts with "!raw ", set action="unknown" and needs_clarification=false
+(this bypasses the LLM path in production)."""
+
+
+def parse_intent(utterance: str, model: str = "claude-sonnet-4-5") -> dict[str, Any]:
+    """Parse a raw utterance into a structured intent dict."""
+    client = anthropic.Anthropic()
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": utterance}],
+        tools=[INTENT_TOOL],
+        tool_choice={"type": "tool", "name": "parse_intent"},
+    )
+
+    # Extract tool use result
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "parse_intent":
+            intent = block.input
+            # Post-parse validation
+            intent = _validate_intent(intent, utterance)
+            return intent
+
+    return {"action": "unknown", "confidence": 0.0, "raw_utterance": utterance}
+
+
+def _validate_intent(intent: dict[str, Any], utterance: str) -> dict[str, Any]:
+    """Apply business rule validation after LLM parse."""
+    intent["raw_utterance"] = utterance
+
+    if intent.get("action") == "quota_grant":
+        tier = intent.get("tier")
+        credits = intent.get("credits")
+        product = intent.get("product", "")
+
+        # Credits require a valid tier
+        if credits and tier and tier not in ["creator", "pro", "business"]:
+            intent["needs_clarification"] = True
+            intent["clarifying_question"] = (
+                f"Credits can only be granted with creator, pro, or business tiers "
+                f"(you said '{tier}'). Which tier did you mean?"
+            )
+            intent["confidence"] = min(intent.get("confidence", 0.5), 0.4)
+
+        # Must have target email
+        if not intent.get("target_email") and not intent.get("needs_clarification"):
+            intent["needs_clarification"] = True
+            intent["clarifying_question"] = "What email address should I target?"
+            intent["confidence"] = 0.3
+
+    if intent.get("action") == "ent_sub_grant" and not intent.get("ae_attribution"):
+        intent["needs_clarification"] = True
+        intent["clarifying_question"] = "Enterprise subs need AE attribution. Which AE should be credited?"
+
+    return intent
+
+
+if __name__ == "__main__":
+    # Quick smoke test
+    test_cases = [
+        "comp teodora@heygen.com a creator sub for a year with 9999 credits",
+        "make mtoth109@gmail.com a creator for 60 days with 100 credits",
+        "who is mtoth109@gmail.com and what did they do last 7 days",
+        "grant 100 api credits to partner@acme.com for 30 days",
+        "give someone some credits",  # should need clarification
+        "14-day enterprise trial for admin@example.com, 5 seats",  # should ask AE
+    ]
+
+    for utt in test_cases:
+        print(f"\n>>> {utt}")
+        result = parse_intent(utt)
+        print(json.dumps(result, indent=2))
