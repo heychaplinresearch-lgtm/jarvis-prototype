@@ -19,7 +19,7 @@ print(f"Launching bot with key: {key[:12]}...")
 
 env = os.environ.copy()
 env['ANTHROPIC_API_KEY'] = key
-env['SLACK_HOME_CHANNEL'] = 'D0BDUSZBB7V'
+env['SLACK_HOME_CHANNEL'] = 'C0BDT0WDDV5'
 
 os.chdir('/home/hermes/jarvis-prototype')
 os.execve(sys.executable, [sys.executable, '/home/hermes/jarvis-prototype/bot.py'], env)

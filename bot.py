@@ -29,7 +29,7 @@ from slack_client import (
     post_message, update_message, get_user_info,
     build_confirmation_card, build_clarifying_question_card, build_audit_ack_card,
 )
-import mock_heygen_api as heygen
+import heygen_cms_api as heygen
 
 CONFIDENCE_THRESHOLD = 0.70
 BOT_USER_ID = "U0BDYHHJQTY"   # @HeyChaplinCode
