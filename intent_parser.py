@@ -12,6 +12,17 @@ from typing import Any
 
 import anthropic
 
+# Module-level singleton — avoid re-initialising the HTTP client on every call.
+# 20 s timeout: intent parse should never need more than that.
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(timeout=20.0)
+    return _anthropic_client
+
 # Legal tier × product combinations (sourced from the brief)
 LEGAL_COMBOS = {
     "quota_grant": {
@@ -99,7 +110,7 @@ Raw CLI mode: if utterance starts with "!raw ", set action="unknown" and needs_c
 
 def parse_intent(utterance: str, model: str = "claude-sonnet-4-5") -> dict[str, Any]:
     """Parse a raw utterance into a structured intent dict."""
-    client = anthropic.Anthropic()
+    client = _get_client()
 
     response = client.messages.create(
         model=model,

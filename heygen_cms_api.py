@@ -9,23 +9,34 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import time
 import urllib.request
 from typing import Any
 
 CMS_BASE = "https://cms-api.heygendev.com"
 
 # ---------------------------------------------------------------------------
-# Auth
+# Auth — cached to avoid spawning a subprocess on every call
 # ---------------------------------------------------------------------------
+_API_KEY_CACHE: str | None = None
+_API_KEY_FETCHED_AT: float = 0.0
+_API_KEY_TTL = 300  # re-fetch every 5 minutes
+
 
 def _get_api_key() -> str:
+    global _API_KEY_CACHE, _API_KEY_FETCHED_AT
+    now = time.monotonic()
+    if _API_KEY_CACHE and (now - _API_KEY_FETCHED_AT) < _API_KEY_TTL:
+        return _API_KEY_CACHE
     result = subprocess.run(
         ["python3", "/opt/genesis/manage-secrets.py", "get", "HEYGEN_CMS_API_KEY"],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=10,
     )
     key = result.stdout.strip()
     if not key or key.startswith("no such secret"):
         raise RuntimeError("HEYGEN_CMS_API_KEY not found in secrets store")
+    _API_KEY_CACHE = key
+    _API_KEY_FETCHED_AT = now
     return key
 
 

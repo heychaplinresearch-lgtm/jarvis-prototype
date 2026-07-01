@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import threading
 from typing import Any
 
 # Add prototype dir to path
@@ -34,17 +35,25 @@ import heygen_cms_api as heygen
 CONFIDENCE_THRESHOLD = 0.70
 BOT_USER_ID = "U0BDYHHJQTY"   # @HeyChaplinCode
 OWNER_SLACK_ID = "U0BBD6002R2"  # yichi.huang — authorized to confirm
+REQUEST_TIMEOUT = 30  # seconds — hard timeout on handle_mention
 
 # Simple poll-based dedup: track event IDs we've seen
 _SEEN_EVENTS: set[str] = set()
 _SEEN_REACTIONS: set[str] = set()
 
 
+_BOT_TOKEN_CACHE: str | None = None
+
+
 def _bot_token() -> str:
+    global _BOT_TOKEN_CACHE
+    if _BOT_TOKEN_CACHE:
+        return _BOT_TOKEN_CACHE
     env_path = os.path.expanduser("~/.hermes/.env")
     for line in open(env_path):
         if line.startswith("SLACK_BOT_TOKEN="):
-            return line.split("=", 1)[1].strip()
+            _BOT_TOKEN_CACHE = line.split("=", 1)[1].strip()
+            return _BOT_TOKEN_CACHE
     raise RuntimeError("SLACK_BOT_TOKEN not found")
 
 
@@ -61,6 +70,38 @@ def is_authorized(user_id: str) -> bool:
     """Check if a user is authorized to confirm ops actions."""
     # For prototype: only the owner (yichi.huang) is authorized
     return user_id == OWNER_SLACK_ID
+
+
+def _handle_mention_with_timeout(event: dict) -> None:
+    """Run handle_mention in the current thread; post a timeout error if it takes > REQUEST_TIMEOUT s."""
+    result = [None]
+    exc_box: list[BaseException | None] = [None]
+
+    def _run():
+        try:
+            handle_mention(event)
+        except Exception as e:
+            exc_box[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=REQUEST_TIMEOUT)
+    if t.is_alive():
+        print(f"[TIMEOUT] handle_mention exceeded {REQUEST_TIMEOUT}s for ts={event.get('ts')}")
+        try:
+            post_message(
+                event["channel"],
+                f"⏱️ Request timed out after {REQUEST_TIMEOUT}s. Please try again.",
+                thread_ts=event["ts"],
+            )
+        except Exception:
+            pass
+    elif exc_box[0]:
+        print(f"[ERROR] handle_mention: {exc_box[0]}")
+        try:
+            post_message(event["channel"], f"❌ Error: {exc_box[0]}", thread_ts=event["ts"])
+        except Exception:
+            pass
 
 
 def handle_mention(event: dict[str, Any]) -> None:
@@ -300,12 +341,14 @@ def poll_once() -> None:
 
         text = msg.get("text", "")
         if f"<@{BOT_USER_ID}>" in text and msg.get("user") != BOT_USER_ID:
-            handle_mention({
+            event = {
                 "text": text,
                 "user": msg.get("user", ""),
                 "channel": os.environ.get("SLACK_HOME_CHANNEL", "D0BDUSZBB7V"),
                 "ts": msg["ts"],
-            })
+            }
+            t = threading.Thread(target=_handle_mention_with_timeout, args=(event,), daemon=True)
+            t.start()
 
     # Poll reactions on pending messages
     for pending in list_pending():
