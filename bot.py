@@ -1,30 +1,41 @@
 """
-Jarvis bot — main event loop.
-
-Listens for @mentions via Slack's Events API (polling mode for prototype;
-production would use Socket Mode or HTTP webhook).
+Jarvis bot — Socket Mode event handler.
 
 Flow:
-  1. @mention received → parse intent
+  1. @mention received (any user) → parse intent
   2a. needs_clarification → post question, wait for reply
-  2b. confidence OK → fetch before_state, post dry-run card, store pending
-  3. ✅ reaction on a pending card → re-snapshot, execute, write audit, ack
-  ❌ reaction → cancel pending
+  2b. confidence OK → fetch before_state, post dry-run card with Block Kit ✅/❌ buttons
+  3. ✅ button → re-snapshot, execute, write audit, ack
+     ❌ button → cancel pending (BUG-1/2 fix: buttons, not emoji reactions)
+
+Bugs fixed in this version:
+  BUG-1: Cancel reaction didn't cancel → buttons properly route to cancel_action
+  BUG-2: Emoji reactions → Block Kit interactive buttons (✅/❌)
+  BUG-3: create_account had no confirm loop → routes through same dry-run flow
+  BUG-4: Slow response → claude-haiku for intent parse; no agentic loop
+  BUG-5: Duplicate execution → atomic claim_pending() before execute
+  BUG-6: Raw API data in messages → _format_ack_fields() sanitizes output
+  BUG-7: Non-Yichi users silently ignored → graceful 403 with name shown
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-import time
 import threading
 from typing import Any
 
-# Add prototype dir to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+
 from intent_parser import parse_intent
-from pending_store import get_by_message_ts, mark_executed, write_pending, list_pending
+from pending_store import (
+    claim_pending, get_by_pending_id, mark_cancelled, mark_executed,
+    reset_to_pending, write_pending,
+)
 from audit_log import write_audit, query_audit
 from slack_client import (
     post_message, update_message, get_user_info,
@@ -34,47 +45,48 @@ import heygen_cms_api as heygen
 
 CONFIDENCE_THRESHOLD = 0.70
 BOT_USER_ID = "U0BDYHHJQTY"   # @HeyChaplinCode
-OWNER_SLACK_ID = "U0BBD6002R2"  # yichi.huang — authorized to confirm
-REQUEST_TIMEOUT = 30  # seconds — hard timeout on handle_mention
+OWNER_SLACK_ID = "U0BBD6002R2"  # yichi.huang — authorized to confirm write ops
+REQUEST_TIMEOUT = 25  # seconds — hard cap (BUG-4)
 
-# Simple poll-based dedup: track event IDs we've seen
-_SEEN_EVENTS: set[str] = set()
-_SEEN_REACTIONS: set[str] = set()
+# ---------------------------------------------------------------------------
+# Token helpers
+# ---------------------------------------------------------------------------
 
-
-_BOT_TOKEN_CACHE: str | None = None
-
-
-def _bot_token() -> str:
-    global _BOT_TOKEN_CACHE
-    if _BOT_TOKEN_CACHE:
-        return _BOT_TOKEN_CACHE
+def _load_env() -> dict[str, str]:
+    env: dict[str, str] = {}
     env_path = os.path.expanduser("~/.hermes/.env")
-    for line in open(env_path):
-        if line.startswith("SLACK_BOT_TOKEN="):
-            _BOT_TOKEN_CACHE = line.split("=", 1)[1].strip()
-            return _BOT_TOKEN_CACHE
-    raise RuntimeError("SLACK_BOT_TOKEN not found")
+    if os.path.exists(env_path):
+        for line in open(env_path):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    return env
 
 
-def _slack_get(method: str, **params) -> dict[str, Any]:
-    import urllib.request, urllib.parse
-    token = _bot_token()
-    qs = urllib.parse.urlencode(params)
-    url = f"https://slack.com/api/{method}?{qs}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    return json.loads(urllib.request.urlopen(req).read())
+_ENV = _load_env()
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN") or _ENV.get("SLACK_BOT_TOKEN", "")
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN") or _ENV.get("SLACK_APP_TOKEN", "")
+
+if not SLACK_BOT_TOKEN:
+    raise RuntimeError("SLACK_BOT_TOKEN not found in environment or ~/.hermes/.env")
+if not SLACK_APP_TOKEN:
+    raise RuntimeError("SLACK_APP_TOKEN not found — Socket Mode requires an xapp-... token")
+
+# ---------------------------------------------------------------------------
+# Bolt app
+# ---------------------------------------------------------------------------
+
+app = App(token=SLACK_BOT_TOKEN)
 
 
 def is_authorized(user_id: str) -> bool:
-    """Check if a user is authorized to confirm ops actions."""
-    # For prototype: only the owner (yichi.huang) is authorized
+    """Check if a user is authorized to confirm write ops."""
     return user_id == OWNER_SLACK_ID
 
 
 def _handle_mention_with_timeout(event: dict) -> None:
-    """Run handle_mention in the current thread; post a timeout error if it takes > REQUEST_TIMEOUT s."""
-    result = [None]
+    """Run handle_mention with a hard timeout, posting an error if exceeded."""
     exc_box: list[BaseException | None] = [None]
 
     def _run():
@@ -105,23 +117,26 @@ def _handle_mention_with_timeout(event: dict) -> None:
 
 
 def handle_mention(event: dict[str, Any]) -> None:
-    """Process an @mention event."""
+    """Process an @mention event (from any user in any channel the bot is in)."""
     text = event.get("text", "")
     user_id = event.get("user", "")
     channel = event.get("channel", "")
     ts = event.get("ts", "")
 
     # Strip the bot mention prefix
-    clean_text = text.replace(f"<@{BOT_USER_ID}>", "").strip()
+    clean_text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
 
     if not clean_text:
         return
 
-    print(f"[MENTION] {user_id}: {clean_text}")
+    print(f"[MENTION] {user_id} in {channel}: {clean_text}")
+
+    # BUG-7 FIX: respond to all users; only block write confirms (not reads)
+    # Lookup/audit queries are open to all; write ops have auth check at confirm time.
 
     # Raw CLI escape hatch
     if clean_text.startswith("!raw "):
-        post_message(channel, "🔧 Raw CLI mode — bypassing NL parse. _(not yet wired to actual CLI in prototype)_", thread_ts=ts)
+        post_message(channel, "🔧 Raw CLI mode — bypassing NL parse. _(not yet wired)_", thread_ts=ts)
         return
 
     # Audit query
@@ -137,7 +152,7 @@ def handle_mention(event: dict[str, Any]) -> None:
             post_message(channel, "\n".join(lines), thread_ts=ts)
         return
 
-    # Parse intent
+    # Parse intent — BUG-4: use haiku (fast), no agentic loop
     post_message(channel, "⏳ Parsing...", thread_ts=ts)
     intent = parse_intent(clean_text)
     print(f"[INTENT] {json.dumps(intent, indent=2)}")
@@ -152,145 +167,187 @@ def handle_mention(event: dict[str, Any]) -> None:
         post_message(channel, question, thread_ts=ts, blocks=blocks)
         return
 
-    # ALL actions (including lookup) go through the dry-run card + ✅ confirmation flow
-    # so the user always sees what will happen before it executes.
     target_email = intent.get("target_email", "")
-    before_state = heygen.get_user_state(target_email)
+    action = intent.get("action")
 
-    # Post the dry-run card
+    # Guard: validate user exists for ops that require it
+    if action in ("lookup", "quota_grant"):
+        before_state = heygen.get_user_state(target_email)
+        if before_state.get("user_id") is None:
+            err = before_state.get("error", {})
+            code = err.get("code", "?") if isinstance(err, dict) else "?"
+            post_message(
+                channel,
+                f"❌ User `{target_email}` not found in HeyGen (CMS code {code}). "
+                f"Check the email and try again.",
+                thread_ts=ts,
+            )
+            return
+    elif action == "create_account":
+        before_state = {}  # BUG-3 fix: create_account now goes through dry-run like everything else
+    else:
+        before_state = heygen.get_user_state(target_email)
+
+    # Allocate pending_id before posting card so it's embedded in button values
+    import uuid
+    pending_id = f"jrv_p_{uuid.uuid4().hex[:8]}"
+
+    # Post the dry-run card with Block Kit buttons
     resp = post_message(
         channel,
-        f"Action preview for `{target_email}` — react ✅ to confirm",
+        f"Action preview for `{target_email}` — confirm or cancel below",
         thread_ts=ts,
-        blocks=build_confirmation_card(intent, before_state, "pending"),
+        blocks=build_confirmation_card(intent, before_state, pending_id),
     )
     card_ts = resp["ts"]
 
-    # Store pending
-    pending_id = write_pending(
+    # Store pending with pre-allocated ID
+    write_pending(
         actor_slack_id=user_id,
         intent=intent,
         before_state=before_state,
         channel_id=channel,
         thread_ts=ts,
         message_ts=card_ts,
+        pending_id=pending_id,
     )
 
-    # Update card with real pending_id
-    update_message(
-        channel, card_ts,
-        f"Action preview for `{target_email}` — react ✅ to confirm",
-        blocks=build_confirmation_card(intent, before_state, pending_id),
-    )
-
-    print(f"[PENDING] {pending_id} stored, waiting for ✅ on {card_ts}")
+    print(f"[PENDING] {pending_id} stored, waiting for button click on {card_ts}")
 
 
-def handle_reaction(event: dict[str, Any]) -> None:
-    """Process a reaction_added event on a pending confirmation card."""
-    reaction = event.get("reaction", "")
-    user_id = event.get("user", "")
-    item = event.get("item", {})
-    channel = item.get("channel", "")
-    item_ts = item.get("ts", "")
-
-    if reaction not in ("white_check_mark", "x"):
-        return  # only care about ✅ and ❌
-
-    # Dedup
-    dedup_key = f"{item_ts}:{reaction}:{user_id}"
-    if dedup_key in _SEEN_REACTIONS:
+def handle_block_action(body: dict[str, Any]) -> None:
+    """
+    Process Block Kit button actions (✅ Confirm / ❌ Cancel).
+    BUG-1/BUG-2 fix: replaced emoji reaction handling with buttons.
+    """
+    user_id = body.get("user", {}).get("id", "")
+    channel_id = body.get("channel", {}).get("id", "")
+    actions = body.get("actions", [])
+    if not actions:
         return
-    _SEEN_REACTIONS.add(dedup_key)
 
-    pending = get_by_message_ts(item_ts)
+    action = actions[0]
+    action_id = action.get("action_id", "")
+    pending_id = action.get("value", "")
+
+    print(f"[BUTTON] {action_id} from {user_id}, pending={pending_id}")
+
+    pending = get_by_pending_id(pending_id)
     if not pending:
-        return  # not a pending confirmation card (or expired)
+        # Card expired or already acted on
+        post_message(channel_id, f"⚠️ This action (`{pending_id}`) has already been completed or expired.")
+        return
 
+    if pending["status"] not in ("pending", "executing"):
+        post_message(
+            channel_id,
+            f"⚠️ This action (`{pending_id}`) is already `{pending['status']}`.",
+            thread_ts=pending["thread_ts"],
+        )
+        return
+
+    thread_ts = pending["thread_ts"]
     intent = json.loads(pending["intent_json"])
     before_state = json.loads(pending["before_json"])
-
-    print(f"[REACTION] {reaction} from {user_id} on pending {pending['pending_id']}")
-
-    if reaction == "x":
-        mark_executed(pending["pending_id"])  # mark cancelled
-        post_message(channel, "❌ Cancelled.", thread_ts=pending["thread_ts"])
-        return
-
-    # ✅ — check authorization
-    if not is_authorized(user_id):
-        user_info = get_user_info(user_id)
-        name = user_info.get("real_name", user_id)
-        post_message(
-            channel,
-            f"⛔ <@{user_id}> ({name}) is not authorized to confirm ops actions.",
-            thread_ts=pending["thread_ts"],
-        )
-        return
-
-    # TOCTOU: re-snapshot before executing
     target_email = intent.get("target_email", "")
-    current_state = heygen.get_user_state(target_email)
-    if current_state != before_state:
-        post_message(
-            channel,
-            f"⚠️ State changed since dry-run. Updated preview — react ✅ again to confirm with new state.",
-            thread_ts=pending["thread_ts"],
-            blocks=build_confirmation_card(intent, current_state, pending["pending_id"]),
-        )
-        # Update stored before_state
-        import sqlite3
-        import json as _json
-        from pending_store import DB_PATH
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "UPDATE pending_confirmations SET before_json=? WHERE pending_id=?",
-            (_json.dumps(current_state), pending["pending_id"]),
-        )
-        conn.commit()
-        conn.close()
+
+    # ❌ Cancel — anyone who sees the card can cancel (intentional)
+    if action_id == "cancel_action":
+        mark_cancelled(pending_id)
+        update_message(channel_id, pending["message_ts"],
+                       f"~~Action cancelled~~ `{pending_id}`",
+                       blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                               "text": f"❌ *Cancelled* by <@{user_id}> · `{pending_id}`"}}])
+        post_message(channel_id, "❌ Cancelled.", thread_ts=thread_ts)
         return
 
-    # Execute
-    post_message(channel, "⚙️ Executing...", thread_ts=pending["thread_ts"])
-    after_state = _execute_intent(intent)
+    # ✅ Confirm — write ops require authorization
+    if action_id == "confirm_action":
+        # BUG-7 related: non-authorized users get a clear rejection
+        if intent.get("action") != "lookup" and not is_authorized(user_id):
+            user_info = get_user_info(user_id)
+            name = user_info.get("real_name", user_id)
+            post_message(
+                channel_id,
+                f"⛔ <@{user_id}> ({name}) is not authorized to confirm write ops. "
+                f"Only <@{OWNER_SLACK_ID}> can confirm.",
+                thread_ts=thread_ts,
+            )
+            return
 
-    # Write audit row BEFORE acknowledging
-    audit_id = write_audit(
-        actor_slack_id=user_id,
-        action=intent.get("action", "unknown"),
-        result="success",
-        intent=intent,
-        before_state=before_state,
-        after_state=after_state,
-        channel_id=channel,
-        message_ts=item_ts,
-    )
-    mark_executed(pending["pending_id"])
+        # BUG-5 FIX: Atomic claim — prevents duplicate execution
+        claimed = claim_pending(pending_id)
+        if not claimed:
+            post_message(
+                channel_id,
+                f"⚠️ Action `{pending_id}` was already claimed — duplicate click ignored.",
+                thread_ts=thread_ts,
+            )
+            return
 
-    # Ack
-    blocks = build_audit_ack_card(audit_id, intent.get("action", ""), target_email, after_state)
-    post_message(
-        channel,
-        f"✅ Done. Audit: `{audit_id}`",
-        thread_ts=pending["thread_ts"],
-        blocks=blocks,
-    )
-    # Separate audit trail message (searchable)
-    post_message(channel,
-        f":white_check_mark: *Audit trail* | `{audit_id}` | `{intent.get('action')}` | `{target_email}` | by <@{user_id}>",
-        thread_ts=pending["thread_ts"])
-    print(f"[EXECUTED] audit_id={audit_id}")
+        # TOCTOU: re-snapshot before executing
+        current_state = heygen.get_user_state(target_email) if target_email else {}
+        if current_state and current_state != before_state:
+            reset_to_pending(pending_id, json.dumps(current_state))
+            # Rebuild card with fresh state
+            update_message(
+                channel_id, pending["message_ts"],
+                f"⚠️ State changed — please confirm again",
+                blocks=build_confirmation_card(intent, current_state, pending_id),
+            )
+            post_message(
+                channel_id,
+                "⚠️ State changed since dry-run. Updated preview above — click ✅ Confirm again.",
+                thread_ts=thread_ts,
+            )
+            return
+
+        # Execute
+        post_message(channel_id, "⚙️ Executing...", thread_ts=thread_ts)
+        after_state = _execute_intent(intent)
+
+        # Write audit BEFORE ack (SOC2 ordering)
+        audit_id = write_audit(
+            actor_slack_id=user_id,
+            action=intent.get("action", "unknown"),
+            result="success",
+            intent=intent,
+            before_state=before_state,
+            after_state=after_state,
+            channel_id=channel_id,
+            message_ts=pending["message_ts"],
+        )
+        mark_executed(pending_id)
+
+        # Update card to show completed state
+        update_message(channel_id, pending["message_ts"],
+                       f"✅ Completed `{pending_id}`",
+                       blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                               "text": f"✅ *Confirmed & executed* by <@{user_id}> · `{pending_id}`"}}])
+
+        # Ack card — BUG-6: sanitized, no raw blobs
+        blocks = build_audit_ack_card(audit_id, intent.get("action", ""), target_email, after_state)
+        post_message(
+            channel_id,
+            f"✅ Done. Audit: `{audit_id}`",
+            thread_ts=thread_ts,
+            blocks=blocks,
+        )
+        # Separate searchable audit trail message
+        post_message(
+            channel_id,
+            f":white_check_mark: *Audit trail* | `{audit_id}` | `{intent.get('action')}` | `{target_email}` | by <@{user_id}>",
+            thread_ts=thread_ts,
+        )
+        print(f"[EXECUTED] audit_id={audit_id}")
 
 
 def _execute_intent(intent: dict[str, Any]) -> dict[str, Any]:
-    """Execute a validated intent against the mock HeyGen API."""
     action = intent.get("action")
     email = intent.get("target_email", "")
 
     if action == "lookup":
         return heygen.lookup_user(email)
-
     elif action == "quota_grant":
         return heygen.execute_quota_grant(
             email=email,
@@ -306,67 +363,52 @@ def _execute_intent(intent: dict[str, Any]) -> dict[str, Any]:
             duration_days=intent.get("duration_days", 30),
         )
     else:
-        return {"action": action, "status": "mock_executed"}
+        return {"action": action, "status": "not_implemented"}
 
 
-def poll_once() -> None:
-    """Poll for new events. Used in the prototype polling loop."""
-    # Poll mentions
-    result = _slack_get("conversations.history", channel=os.environ.get("SLACK_HOME_CHANNEL", "D0BDUSZBB7V"), limit=5)
-    for msg in reversed(result.get("messages", [])):
-        event_id = msg.get("ts", "")
-        if event_id in _SEEN_EVENTS:
-            continue
-        _SEEN_EVENTS.add(event_id)
+# ---------------------------------------------------------------------------
+# Bolt event handlers
+# ---------------------------------------------------------------------------
 
-        text = msg.get("text", "")
-        if f"<@{BOT_USER_ID}>" in text and msg.get("user") != BOT_USER_ID:
-            event = {
-                "text": text,
-                "user": msg.get("user", ""),
-                "channel": os.environ.get("SLACK_HOME_CHANNEL", "D0BDUSZBB7V"),
-                "ts": msg["ts"],
-            }
-            t = threading.Thread(target=_handle_mention_with_timeout, args=(event,), daemon=True)
-            t.start()
+@app.event("app_mention")
+def on_app_mention(event, say):
+    """Triggered when the bot is @mentioned in any channel it belongs to."""
+    t = threading.Thread(target=_handle_mention_with_timeout, args=(event,), daemon=True)
+    t.start()
 
-    # Poll reactions on pending messages
-    for pending in list_pending():
-        resp = _slack_get(
-            "reactions.get",
-            channel=pending["channel_id"],
-            timestamp=pending["message_ts"],
-            full=1,
-        )
-        msg = resp.get("message", {})
-        for reaction_info in msg.get("reactions", []):
-            reaction = reaction_info.get("name", "")
-            for uid in reaction_info.get("users", []):
-                handle_reaction({
-                    "reaction": reaction,
-                    "user": uid,
-                    "item": {"channel": pending["channel_id"], "ts": pending["message_ts"]},
-                })
 
+@app.action("confirm_action")
+def on_confirm_action(ack, body):
+    """Block Kit ✅ Confirm button."""
+    ack()
+    t = threading.Thread(target=handle_block_action, args=(body,), daemon=True)
+    t.start()
+
+
+@app.action("cancel_action")
+def on_cancel_action(ack, body):
+    """Block Kit ❌ Cancel button."""
+    ack()
+    t = threading.Thread(target=handle_block_action, args=(body,), daemon=True)
+    t.start()
+
+
+# Swallow unhandled message subtypes (edits, file uploads, etc.) to avoid Bolt warnings
+@app.event("message")
+def on_message(event):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("🤖 Jarvis prototype starting — polling for @mentions and reactions...")
-    print(f"   Bot: {BOT_USER_ID} | Authorized: {OWNER_SLACK_ID}")
+    print("🤖 Jarvis starting — Socket Mode (push events, multi-channel)")
+    print(f"   Bot: {BOT_USER_ID} | Authorized confirmer: {OWNER_SLACK_ID}")
     print(f"   Confidence threshold: {CONFIDENCE_THRESHOLD:.0%}")
+    print(f"   Confirmation: Block Kit buttons (not emoji reactions)")
     print()
 
-    # Seed seen events with existing messages so we don't replay history
-    channel = os.environ.get("SLACK_HOME_CHANNEL", "D0BDUSZBB7V")
-    result = _slack_get("conversations.history", channel=channel, limit=20)
-    for msg in result.get("messages", []):
-        _SEEN_EVENTS.add(msg.get("ts", ""))
-    print(f"   Seeded {len(_SEEN_EVENTS)} existing events as seen")
-    print("   Ready — send me a message like: @HeyChaplinCode comp teodora@heygen.com a creator sub for 365 days with 9999 credits")
-    print()
-
-    while True:
-        try:
-            poll_once()
-        except Exception as e:
-            print(f"[ERROR] {e}")
-        time.sleep(3)
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    handler.start()

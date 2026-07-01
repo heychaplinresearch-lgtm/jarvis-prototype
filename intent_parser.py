@@ -108,13 +108,14 @@ Raw CLI mode: if utterance starts with "!raw ", set action="unknown" and needs_c
 (this bypasses the LLM path in production)."""
 
 
-def parse_intent(utterance: str, model: str = "claude-sonnet-4-5") -> dict[str, Any]:
+def parse_intent(utterance: str, model: str = "claude-haiku-4-5") -> dict[str, Any]:
     """Parse a raw utterance into a structured intent dict."""
     client = _get_client()
 
     response = client.messages.create(
         model=model,
         max_tokens=1024,
+        temperature=0,  # deterministic — same input always produces same parse
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": utterance}],
         tools=[INTENT_TOOL],

@@ -1,6 +1,10 @@
 """
 Jarvis Slack client — thin wrapper over the Slack Web API.
 Handles posting Block Kit confirmation cards and reading thread context.
+
+Confirmation flow uses Block Kit interactive buttons (not emoji reactions):
+  ✅ Confirm  /  ❌ Cancel
+This fixes BUG-1 and BUG-2 — reactions are lossy and anyone can react.
 """
 from __future__ import annotations
 
@@ -65,7 +69,7 @@ def get_user_info(user_id: str) -> dict[str, Any]:
 
 def build_confirmation_card(intent: dict[str, Any], before_state: dict[str, Any],
                              pending_id: str) -> list[dict[str, Any]]:
-    """Build a Block Kit confirmation card for a pending action."""
+    """Build a Block Kit confirmation card with interactive ✅/❌ buttons."""
     action = intent.get("action", "unknown")
     target = intent.get("target_email", "unknown")
     confidence = intent.get("confidence", 0)
@@ -86,12 +90,12 @@ def build_confirmation_card(intent: dict[str, Any], before_state: dict[str, Any]
         "text": {"type": "mrkdwn", "text": summary},
     })
 
-    # Diff fields
+    # Diff fields — sanitized (no raw API blobs)
     diff_fields = _build_diff_fields(intent, before_state)
     if diff_fields:
         blocks.append({"type": "section", "fields": diff_fields})
 
-    # Confidence + utterance
+    # Confidence + pending ID
     confidence_emoji = "🟢" if confidence >= 0.85 else "🟡" if confidence >= 0.6 else "🔴"
     blocks.append({
         "type": "context",
@@ -112,18 +116,31 @@ def build_confirmation_card(intent: dict[str, Any], before_state: dict[str, Any]
     if utterance:
         blocks.append({
             "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"💬 _\"{utterance}\"_"}],
+            "elements": [{"type": "mrkdwn", "text": f"💬 _{utterance}_"}],
         })
 
     blocks.append({"type": "divider"})
 
-    # Confirm instruction
+    # BUG-1/BUG-2 FIX: Block Kit buttons, not emoji instructions
     blocks.append({
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": "React with ✅ to execute · ❌ to cancel · or reply to ask a question.",
-        },
+        "type": "actions",
+        "block_id": f"confirm_actions_{pending_id}",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
+                "style": "primary",
+                "value": pending_id,
+                "action_id": "confirm_action",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "❌ Cancel", "emoji": True},
+                "style": "danger",
+                "value": pending_id,
+                "action_id": "cancel_action",
+            },
+        ],
     })
 
     return blocks
@@ -143,8 +160,9 @@ def build_clarifying_question_card(question: str) -> list[dict[str, Any]]:
 
 def build_audit_ack_card(audit_id: str, action: str, target: str,
                           after_state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a post-execution summary card — no raw API blobs."""
     if action == "lookup":
-        # Show human-readable user info for lookups
+        # Show human-readable user info for lookups (BUG-6: no raw JSON)
         fields = []
         display_keys = ["user_id", "space_id", "tier", "internal", "country_code", "registration_ts"]
         for k in display_keys:
@@ -159,15 +177,17 @@ def build_audit_ack_card(audit_id: str, action: str, target: str,
             {"type": "divider"},
         ]
         if fields:
-            # Slack allows max 10 fields per section block
             for i in range(0, len(fields), 10):
                 blocks.append({"type": "section", "fields": fields[i:i+10]})
-        # Quotas as a separate context line if present
-        quotas = after_state.get("quotas")
-        if quotas:
+        # Quotas summary — key/value only, not full raw JSON
+        quotas = after_state.get("quotas", {})
+        if quotas and isinstance(quotas, dict):
+            quota_parts = [f"`{k}`: {v}" for k, v in list(quotas.items())[:5]]
+            if len(quotas) > 5:
+                quota_parts.append(f"… +{len(quotas)-5} more")
             blocks.append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"📊 Quotas: `{json.dumps(quotas)}`"}],
+                "elements": [{"type": "mrkdwn", "text": "📊 Quotas: " + " · ".join(quota_parts)}],
             })
         blocks.append({
             "type": "context",
@@ -175,19 +195,55 @@ def build_audit_ack_card(audit_id: str, action: str, target: str,
         })
         return blocks
 
-    return [
+    # Write ops (quota_grant, create_account, etc.) — show structured result
+    blocks = [
         {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "✅ Jarvis — Done", "emoji": True},
+        },
+        {"type": "divider"},
+    ]
+    summary_fields = _format_ack_fields(action, target, after_state)
+    if summary_fields:
+        blocks.append({"type": "section", "fields": summary_fields})
+    else:
+        blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"✅ *Done.* `{action}` on `{target}`\n"
-                    f"Audit: `{audit_id}`\n"
-                    f"After: `{json.dumps(after_state)}`"
-                ),
+                "text": f"`{action}` applied to `{target}`",
             },
-        }
-    ]
+        })
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": f"🔎 Audit: `{audit_id}`"}],
+    })
+    return blocks
+
+
+def _format_ack_fields(action: str, target: str, after: dict[str, Any]) -> list[dict[str, Any]]:
+    """Format structured key/value fields for the ack card — no raw API dumps."""
+    fields = []
+    if action in ("quota_grant", "subscription_grant", "credit_top_up"):
+        if after.get("tier"):
+            fields.append({"type": "mrkdwn", "text": f"*Tier:*\n`{after['tier']}`"})
+        if after.get("credits_granted"):
+            fields.append({"type": "mrkdwn", "text": f"*Credits granted:*\n`{after['credits_granted']:,}`"})
+        if after.get("duration_days"):
+            fields.append({"type": "mrkdwn", "text": f"*Duration:*\n`{after['duration_days']}d`"})
+        if after.get("expires"):
+            fields.append({"type": "mrkdwn", "text": f"*Expires:*\n`{after['expires']}`"})
+        if after.get("quota_id"):
+            fields.append({"type": "mrkdwn", "text": f"*Quota ID:*\n`{after['quota_id']}`"})
+    elif action == "create_account":
+        if after.get("email"):
+            fields.append({"type": "mrkdwn", "text": f"*Email:*\n`{after['email']}`"})
+        if after.get("space_id"):
+            fields.append({"type": "mrkdwn", "text": f"*Space ID:*\n`{after['space_id']}`"})
+        fields.append({"type": "mrkdwn", "text": f"*Created:*\n`{after.get('created', False)}`"})
+        if after.get("tier"):
+            fields.append({"type": "mrkdwn", "text": f"*Tier:*\n`{after['tier']}`"})
+    return fields
 
 
 def _format_action_summary(intent: dict[str, Any], before: dict[str, Any]) -> str:
@@ -229,13 +285,26 @@ def _format_action_summary(intent: dict[str, Any], before: dict[str, Any]) -> st
 
 
 def _build_diff_fields(intent: dict[str, Any], before: dict[str, Any]) -> list[dict[str, Any]]:
+    """Sanitized diff — show only relevant fields, never raw API blobs."""
     fields = []
 
+    # Before: only show meaningful subset
     if before:
-        fields.append({
-            "type": "mrkdwn",
-            "text": f"*Before:*\n```{json.dumps(before, indent=None)}```",
-        })
+        before_parts = []
+        for k in ("tier", "api_tier"):
+            if before.get(k):
+                before_parts.append(f"{k}: {before[k]}")
+        # Summarize quotas
+        quotas = before.get("quotas", {})
+        if quotas and isinstance(quotas, dict):
+            top = list(quotas.items())[:3]
+            quota_str = ", ".join(f"{k}={v}" for k, v in top)
+            before_parts.append(f"quotas: {quota_str}")
+        if before_parts:
+            fields.append({
+                "type": "mrkdwn",
+                "text": f"*Before:*\n```{chr(10).join(before_parts)}```",
+            })
 
     after_preview = {}
     if intent.get("tier"):
